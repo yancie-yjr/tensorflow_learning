@@ -1,0 +1,564 @@
+1、简介
+
+    对于tensorflow.contrib这个库，tensorflow官方对它的描述是：此目录中的任何代码未经官方支持，可能会随时更改或删除。每个目录下都有指定的所有者。它旨在包含额外功能和贡献，最终会合并到核心TensorFlow中，但其接口可能仍然会发生变化，或者需要进行一些测试，看是否可以获得更广泛的接受。所以slim依然不属于原生tensorflow。那么什么是slim？slim到底有什么用？
+    slim是一个使构建，训练，评估神经网络变得简单的库。它可以消除原生tensorflow里面很多重复的模板性的代码，让代码更紧凑，更具备可读性。另外slim提供了很多计算机视觉方面的著名模型（VGG, AlexNet等），我们不仅可以直接使用，甚至能以各种方式进行扩展。
+
+Slim由几个独立存在的部分组成，以下为主要的模块：
+    arg_scope: 提供了一个新的scope，它允许用户定义在这个scope内的许多特殊操作（比如卷积、池化等）的默认参数。
+    data: 这个模块包含data_decoder、prefetch_queue、dataset_data_provider、tfexample_decoder、dataset、data_provider、parallel_reader。
+    evaluation: 包含一些评估模型的例程。
+    layers: 包含使用TensorFlow搭建模型的一些high level layers 。
+    learning: 包含训练模型的一些例程。
+    losses: 包含常用的损失函数。
+    metrics: 包含一些常用的评估指标。
+    nets:  包含一些常用的网络模型的定义，比如VGG和 AlexNet。
+    queues: 提供一个上下文管理器，使得开启和关闭一个QueueRunners.更加简单和安全。
+    regularizers: 包含权重正则化器。
+    variables: 为变量的创建和操作提供了比较方面的包装器。
+2、定义模型
+
+  通过组合slim中变量(variables)、网络层(layer)、前缀名(scope)，模型可以被简洁的定义。
+（1）变量(Variables)定义
+
+    在原始的TensorFlow中，创建变量时，要么需要预定义的值，要么需要一个初始化机制（比如从高斯分布中随机采样）。此外，如果需要在一个特定的特备（比如GPU）上创建一个变量，这个变量必须被显式的创建。为了减少创建变量的代码量，slim提供了一系列包装器函数允许调用者轻易的创建变量。
+    例如，为了创建一个权重变量，它使用截断正太分布初始化、使用L2的正则化损失并且把这个变量放到CPU中，我们只需要简单的做如下声明：
+
+    weights = slim.variable('weights',
+                             shape=[10, 10, 3 , 3],
+                             initializer=tf.truncated_normal_initializer(stddev=0.1),
+                             regularizer=slim.l2_regularizer(0.05),
+                             device='/CPU:0')
+
+    注意在原本的TensorFlow中，有两种类型的变量：常规（regular）变量和局部（local）变量。大部分的变量都是常规变量，它们一旦被创建，它们就会被保存到磁盘。而局部变量只存在于一个Session的运行期间，它们并不会被保存到磁盘。在Slim中，模型变量代表一个模型中的各种参数，Slim通过定义模型变量，进一步把各种变量区分开来。模型变量在训练过程中不断被训练和调参，在评估和预测时可以从checkpoint文件中加载进来，例如被slim.fully_connected() 或 slim.conv2d()网络层创建的变量。而非模型变量是指那些在训练和评估中用到的但是在预测阶段没有用到的变量，例如global_step变量在训练和评估中用到，但是它并不是一个模型变量。同样，移动平均变量可能反映模型变量，但移动平均值本身不是模型变量。模型变量和常规变量可以被Slim很容易的创建如下：
+
+    # 模型变量
+    weights = slim.model_variable('weights',
+                                  shape=[10, 10, 3 , 3],
+                                  initializer=tf.truncated_normal_initializer(stddev=0.1),
+                                  regularizer=slim.l2_regularizer(0.05),
+                                  device='/CPU:0')
+    model_variables = slim.get_model_variables()
+     
+    # 常规变量
+    my_var = slim.variable('my_var',
+                           shape=[20, 1],
+                           initializer=tf.zeros_initializer())
+    regular_variables_and_model_variables = slim.get_variables()
+
+    那这是怎么工作的呢？当你通过Slim的网络层或者直接通过slim.model_variable()创建模型变量时，Slim把模型变量加入到tf.GraphKeys.MODEL_VARIABLES 的collection中。那如果你有属于自己的自定义网络层或者变量创建例程，但是你仍然想要Slim来帮你管理，这时要怎么办呢？Slim提供了一个便利的函数把模型变量加入到它的collection中。
+
+    my_model_variable = CreateViaCustomCode()
+     
+    # 让Slim知道有额外的变量
+    slim.add_model_variable(my_model_variable)
+
+（2）网络层（layers）定义
+
+    虽然TensorFlow操作集非常广泛，但神经网络的开发人员通常会根据更高级别的概念来考虑模型，例如“层”，“损失”，“度量”和“网络”。一个网络层，比如一个卷积层、一个全连接层或者一个BatchNorm层相对于一个简单的TensorFlow操作而言是非常的抽象的，而且一个网络层通常会包含多个TensorFlow的操作。此外，不像TensorFlow许多原生的操作一样，一个网络层通常（但不总是）通常有与之相关联的变量。例如，神经网络中的一个卷积层通常由以下几个low-level的操作组成：
+    1）创建权重和偏置变量
+    2）将权重和输入或者前一层的输出进行卷积
+    3）对卷积的结果加上偏置项
+    4）对结果使用激活函数
+使用原生的TensorFlow代码来实现的话，这是非常麻烦的，如下：
+
+    input = ...
+    with tf.name_scope('conv1_1') as scope:
+      kernel = tf.Variable(tf.truncated_normal([3, 3, 64, 128], dtype=tf.float32,
+                                               stddev=1e-1), name='weights')
+      conv = tf.nn.conv2d(input, kernel, [1, 1, 1, 1], padding='SAME')
+      biases = tf.Variable(tf.constant(0.0, shape=[128], dtype=tf.float32),
+                           trainable=True, name='biases')
+      bias = tf.nn.bias_add(conv, biases)
+      conv1 = tf.nn.relu(bias, name=scope)
+
+    为了减轻这种重复码代码的工作量，Slim提供了许多定义在网络层（layer）层次的操作，这些操作使得创建模型更加方便。比如，使用Slim中的函数来创建一个和上面类似网络层如下：
+
+    input = ...
+    net = slim.conv2d(input, 128, [3, 3], scope='conv1_1')
+
+    Slim提供了在搭建神经网络模型时许多函数的标准实现，包括如下（以下函数的实现参考源码）：    
+Layer   	 TF-Slim
+BiasAdd（加上偏置） 	slim.bias_add
+BatchNorm（归一化）   	slim.batch_norm
+Conv2d（2维卷积）  	slim.conv2d
+Conv2dInPlane 	slim.conv2d_in_plane
+Conv2dTranspose (反卷积)  	slim.conv2d_transpose
+FullyConnected（全连接） 	slim.fully_connected
+AvgPool2D（2维平均池化）   	slim.avg_pool2d
+Dropout 	slim.dropout
+Flatten（展为一维）   	slim.flatten
+MaxPool2D（2维最大池化） 	slim.max_pool2d
+OneHotEncoding（onehot编码）   	slim.one_hot_encoding
+SeparableConv2（可分离卷积） 	slim.separable_conv2d
+UnitNorm（单位归一化）   	 slim.unit_norm
+
+    Slim也提供了两个称为repeat和stack的元操作，这两个操作允许用户重复的使用某个相同的操作。比如，考虑如下VGG网络中的代码片段，在连续的两个池化层之间会执行多个卷积操作：
+
+    net = ...
+    net = slim.conv2d(net, 256, [3, 3], scope='conv3_1')
+    net = slim.conv2d(net, 256, [3, 3], scope='conv3_2')
+    net = slim.conv2d(net, 256, [3, 3], scope='conv3_3')
+    net = slim.max_pool2d(net, [2, 2], scope='pool2')
+
+    一种减少这种代码重复的方式是使用循环，例如：
+
+    net = ...
+    for i in range(3):
+      net = slim.conv2d(net, 256, [3, 3], scope='conv3_%d' % (i+1))
+    net = slim.max_pool2d(net, [2, 2], scope='pool2')
+
+   而使用Slim提供的slim.repeat()操作将更加简洁：
+
+    net = slim.repeat(net, 3, slim.conv2d, 256, [3, 3], scope='conv3')
+    net = slim.max_pool2d(net, [2, 2], scope='pool2')
+
+    注意，slim.repeat()操作不仅仅可以应用相同的参数，它还可以为操作加上scope，因此，被赋予每个后续slim.conv2d()操作的scope都被附加上下划线和编号。具体来说，在上例中的scope将会被命名为：'conv3/conv3_1', 'conv3/conv3_2' 和 'conv3/conv3_3'。
+    此外，Slim的slim.stack()操作允许调用者使用不同的参数来调用相同的操作，从而建立一个堆栈式（stack）或者塔式（Tower）的网络层。slim.stack()同样也为每个操作创建了一个新的tf.variable_scope()。比如，创建多层感知机（MLP）的简单的方式如下：
+
+    # 常规方式
+    x = slim.fully_connected(x, 32, scope='fc/fc_1')
+    x = slim.fully_connected(x, 64, scope='fc/fc_2')
+    x = slim.fully_connected(x, 128, scope='fc/fc_3')
+     
+    # 使用slim.stack()方式
+    slim.stack(x, slim.fully_connected, [32, 64, 128], scope='fc')
+
+    在这个例子中，slim.stack()三次调用slim.fully_connected()，把每次函数调用的输出传递给下一次的调用，而每次调用的隐层的单元数从32到64到128,。同样的，我们也可以用slim.stack()来简化多个卷积操作：
+
+    # 常规方式
+    x = slim.conv2d(x, 32, [3, 3], scope='core/core_1')
+    x = slim.conv2d(x, 32, [1, 1], scope='core/core_2')
+    x = slim.conv2d(x, 64, [3, 3], scope='core/core_3')
+    x = slim.conv2d(x, 64, [1, 1], scope='core/core_4')
+     
+    # 使用Slim.stack():
+    slim.stack(x, slim.conv2d, [(32, [3, 3]), (32, [1, 1]), (64, [3, 3]), (64, [1, 1])], scope='core')
+
+（3）Scopes定义
+
+    除了TensorFlow中的scope机制（name_scope, variable_scope），Slim添加了一种新的称为arg_scope的机制。这种新的scope允许一个调用者在arg_scope中定义一个或多个操作的许多默认参数，这些参数将会在这些操作中传递下去。通过实例可以更好地说明这个功能。考虑如下代码：
+
+    net = slim.conv2d(inputs, 64, [11, 11], 4, padding='SAME',
+                      weights_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                      weights_regularizer=slim.l2_regularizer(0.0005), scope='conv1')
+    net = slim.conv2d(net, 128, [11, 11], padding='VALID',
+                      weights_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                      weights_regularizer=slim.l2_regularizer(0.0005), scope='conv2')
+    net = slim.conv2d(net, 256, [11, 11], padding='SAME',
+                      weights_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                      weights_regularizer=slim.l2_regularizer(0.0005), scope='conv3')
+
+    可以看到，这三个卷积共享某些相同的超参数。有两个有相同的padding方式，三个都有相同的权重初始化器和权重正则化器。这种代码阅读性很差而且包含很多可以被分解出去的重复值，一个可行的解决方案是指定变量的默认值。
+
+    padding = 'SAME'
+    initializer = tf.truncated_normal_initializer(stddev=0.01)
+    regularizer = slim.l2_regularizer(0.0005)
+    net = slim.conv2d(inputs, 64, [11, 11], 4,
+                      padding=padding,
+                      weights_initializer=initializer,
+                      weights_regularizer=regularizer,
+                      scope='conv1')
+    net = slim.conv2d(net, 128, [11, 11],
+                      padding='VALID',
+                      weights_initializer=initializer,
+                      weights_regularizer=regularizer,
+                      scope='conv2')
+    net = slim.conv2d(net, 256, [11, 11],
+                      padding=padding,
+                      weights_initializer=initializer,
+                      weights_regularizer=regularizer,
+                      scope='conv3')
+
+    这种解决方案确保三个卷积层共享相同的参数值，但是却并没有完全减少代码量。通过使用arg_scope，我们既可以确保每层共享相同的参数值，而且也可以简化代码：
+
+      with slim.arg_scope([slim.conv2d], padding='SAME',
+                          weights_initializer=tf.truncated_normal_initializer(stddev=0.01)
+                          weights_regularizer=slim.l2_regularizer(0.0005)):
+        net = slim.conv2d(inputs, 64, [11, 11], scope='conv1')
+        net = slim.conv2d(net, 128, [11, 11], padding='VALID', scope='conv2')
+        net = slim.conv2d(net, 256, [11, 11], scope='conv3')
+
+   如上述例子所示，arg_scope的使用使得代码更加简洁、简单而且更容易维护。注意，尽管在arg_scope中参数值被具体制定了，但是它们仍然可以被局部重写。特别的，上述三个卷积的padding方式均被指定为‘SAME’，但是第二个卷积的的padding可以被重写为‘VALID’。
+    我们也可以嵌套使用arg_scope，在相同的scope内使用多个操作，例如：
+
+    with slim.arg_scope([slim.conv2d, slim.fully_connected],
+                          activation_fn=tf.nn.relu,
+                          weights_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                          weights_regularizer=slim.l2_regularizer(0.0005)):
+      with slim.arg_scope([slim.conv2d], stride=1, padding='SAME'):
+        net = slim.conv2d(inputs, 64, [11, 11], 4, padding='VALID', scope='conv1')
+        net = slim.conv2d(net, 256, [5, 5],
+                          weights_initializer=tf.truncated_normal_initializer(stddev=0.03),
+                          scope='conv2')
+        net = slim.fully_connected(net, 1000, activation_fn=None, scope='fc')
+
+    在这个例子中，第一个arg_scope对slim.conv2d()和slim.fully_connected()采用相同的权重初始化器和权重正则化器参数。在第二个arg_scope中，只针对slim.conv2d的附加的默认参数被具体制定。
+
+    接下来我们定义VGG16网络，通过组合Slim的变量、操作和Scope，我们可以用很少的几行代码写一个常规上来讲非常复杂的网络，整个VGG网络的定义如下：
+
+    def vgg16(inputs):
+      with slim.arg_scope([slim.conv2d, slim.fully_connected],
+                          activation_fn=tf.nn.relu,
+                          weights_initializer=tf.truncated_normal_initializer(0.0, 0.01),
+                          weights_regularizer=slim.l2_regularizer(0.0005)):
+        net = slim.repeat(inputs, 2, slim.conv2d, 64, [3, 3], scope='conv1')
+        net = slim.max_pool2d(net, [2, 2], scope='pool1')
+        net = slim.repeat(net, 2, slim.conv2d, 128, [3, 3], scope='conv2')
+        net = slim.max_pool2d(net, [2, 2], scope='pool2')
+        net = slim.repeat(net, 3, slim.conv2d, 256, [3, 3], scope='conv3')
+        net = slim.max_pool2d(net, [2, 2], scope='pool3')
+        net = slim.repeat(net, 3, slim.conv2d, 512, [3, 3], scope='conv4')
+        net = slim.max_pool2d(net, [2, 2], scope='pool4')
+        net = slim.repeat(net, 3, slim.conv2d, 512, [3, 3], scope='conv5')
+        net = slim.max_pool2d(net, [2, 2], scope='pool5')
+        net = slim.fully_connected(net, 4096, scope='fc6')
+        net = slim.dropout(net, 0.5, scope='dropout6')
+        net = slim.fully_connected(net, 4096, scope='fc7')
+        net = slim.dropout(net, 0.5, scope='dropout7')
+        net = slim.fully_connected(net, 1000, activation_fn=None, scope='fc8')
+      return net
+
+3、训练模型
+
+    训练TensorFlow的模型需要一个模型（model）、一个损失函数（loss）、梯度计算和一个训练过程，训练过程迭代地计算损失函数相对于权重的梯度并且根据梯度值来更新权重值。在训练和评估过程中，Slim提供了一些通用的损失函数和一系列帮助（helper）函数
+（1）损失函数(Losses)
+
+    损失函数定义了一个我们需要优化的数量值。对于分类问题而言，损失函数通常是类别真实分布和预测分布之间的交叉熵。对于回归问题而言，损失函数通常是真实值和预测值之间差值的平方和。在一些模型中，比如多任务的学习模型，就需要同时使用多个损失函数。换句话说，最终被优化的损失函数是其它损失函数的总和。比如，考虑一个这样的模型，它需要同时预测图像中场景的类别和每个像素的相机深度值（the depth from the camera of each pixel），这个模型的损失函数将是分类损失和深度值预测损失之和。
+    Slim的损失函数模块提供了一个简单易用的机制，可以定义和跟踪损失函数，考虑一个训练VGG16网络的简单例子:
+
+    import tensorflow as tf
+    import tensorflow.contrib.slim.nets as nets
+    vgg = nets.vgg
+     
+    # 加载图像和标签
+    images, labels = ...
+     
+    # 创建模型
+    predictions, _ = vgg.vgg_16(images)
+     
+    # 定义损失函数和各种算是求和
+    loss = slim.losses.softmax_cross_entropy(predictions, labels)
+     
+
+    在这个例子中，我们首先创建模型（使用Slim中的VGG实现），然后添加标准的分类损失。现在，让我看一个有多任务的模型，这个模型会产生多个输出。
+
+    # 加载图像和标签
+    images, scene_labels, depth_labels = ...
+     
+    # 创建模型
+    scene_predictions, depth_predictions = CreateMultiTaskModel(images)
+     
+    # 定义损失函数和获取总的损失
+    classification_loss = slim.losses.softmax_cross_entropy(scene_predictions, scene_labels)
+    sum_of_squares_loss = slim.losses.sum_of_squares(depth_predictions, depth_labels)
+     
+    # 下面两行代码的效果相同
+    total_loss = classification_loss + sum_of_squares_loss
+    total_loss = slim.losses.get_total_loss(add_regularization_losses=False)
+
+    在这个例子中，我们有两个损失，分别是通过调用slim.losses.softmax_cross_entropy() 和 slim.losses.sum_of_squares()得到的，通过把它们加在一起或者调用slim.losses.sum_of_squares()函数我们可以获得总的损失。这是怎么工作的呢？当你通过Slim创建一个损失函数的时候，Slim把这个损失添加到一个特殊的TensorFlow collection中，这就使得你可以手动管理总的损失，也可以让Slim帮你管理总的损失。
+    那如果你想要Slim帮你管理一个你自定义的损失函数怎么办呢？loss.py中有一个函数可以把你自定义的损失添加到Slim collection中，比如：
+
+    # 加载图像和标签
+    images, scene_labels, depth_labels, pose_labels = ...
+     
+    # 创建模型
+    scene_predictions, depth_predictions, pose_predictions = CreateMultiTaskModel(images)
+     
+    # 定义损失函数和获取总的损失
+    classification_loss = slim.losses.softmax_cross_entropy(scene_predictions, scene_labels)
+    sum_of_squares_loss = slim.losses.sum_of_squares(depth_predictions, depth_labels)
+    pose_loss = MyCustomLossFunction(pose_predictions, pose_labels)
+     
+    # 让Slim知道你自定义的附加损失
+    slim.losses.add_loss(pose_loss) 
+     
+    # 下列两种计算总的损失的方式是等价的
+    regularization_loss = tf.add_n(slim.losses.get_regularization_losses())
+    total_loss1 = classification_loss + sum_of_squares_loss + pose_loss + regularization_loss
+     
+    # （默认情况下，正则化损失是包含在总的损失之内的）
+    total_loss2 = slim.losses.get_total_loss()
+
+    在这个例子中，我们既可以手动管理总的损失函数，也可以让Slim知道我们自定义的附加损失让后让Slim帮我们管理。
+（2）循环训练(Training Loop)
+
+    在learning.py文件中，Slim提供了一系列简单强大的训练模型的工具。其中就包含了一个训练函数，它重复的测量损失、计算梯度值并且保存模型到磁盘中，此外也包含了手动计算梯度的几个方便的函数。比如，一旦我们确定了模型、损失函数和优化器，我们就可以调用slim.learning.create_train_op() 和 slim.learning.train()来执行优化操作
+ 
+
+    g = tf.Graph()
+     
+    # 创建模型和确定损失函数
+    ...
+     
+    total_loss = slim.losses.get_total_loss()
+    optimizer = tf.train.GradientDescentOptimizer(learning_rate)
+     
+    # 创建训练操作确保我们每次请求计算损失、运行权重更新操作和计算梯度值
+    train_op = slim.learning.create_train_op(total_loss, optimizer)
+    logdir = ... # Where checkpoints are stored.
+     
+    slim.learning.train(
+        train_op,
+        logdir,
+        number_of_steps=1000,
+        save_summaries_secs=300,
+        save_interval_secs=600):
+
+    在这个例子中，slim.learning.train()提供了一个训练操作，它有两个作用：第一个是计算损失，第二个是计算梯度值，logdir指定了保存checkpoint文件和event文件的目录。我们可以指定梯度更新次数为任意数字（也就是总的迭代次数），在这个例子中，我们要求执行1000次迭代。最后，save_summaries_secs=300表示我们每5分钟计算一次summaries，save_interval_secs=600 表示我们每10分钟保存一次checkpoint文件。
+    训练VGG16的模型如下：
+
+    import tensorflow as tf
+    import tensorflow.contrib.slim.nets as nets
+    slim = tf.contrib.slim
+    vgg = nets.vgg...
+     
+    train_log_dir = ...
+    if not tf.gfile.Exists(train_log_dir):
+      tf.gfile.MakeDirs(train_log_dir)
+     
+    with tf.Graph().as_default():
+      # 开启数据加载
+      images, labels = ...
+     
+      # 定义模型
+      predictions = vgg.vgg_16(images, is_training=True)
+     
+      # 指定损失函数
+      slim.losses.softmax_cross_entropy(predictions, labels)
+     
+      total_loss = slim.losses.get_total_loss()
+      tf.summary.scalar('losses/total_loss', total_loss)
+     
+      # 指定优化器
+      optimizer = tf.train.GradientDescentOptimizer(learning_rate=.001)
+     
+      # 创建训练操作，确保当我们获取损失用于评估时，权重跟新和梯度值已经被计算
+      train_tensor = slim.learning.create_train_op(total_loss, optimizer)
+     
+      # 开始训练
+      slim.learning.train(train_tensor, train_log_dir)
+
+4、已存在模型的调参（fine-tuning）
+（1）简要回顾从checkpoint文件中恢复变量
+
+    在一个模型被训练之后，我们可以使用tf.train.Saver()函数从checkpoint文件中恢复变量和模型。在很多情况下， tf.train.Saver()提供了一个简单的机制来恢复所有或一部分变量。
+
+    # 创建一些变量
+    v1 = tf.Variable(..., name="v1")
+    v2 = tf.Variable(..., name="v2")
+    ...
+     
+    # 对恢复的所有变量添加一些操作
+    restorer = tf.train.Saver()
+     
+    # 对恢复的一些变量添加一些操作
+    restorer = tf.train.Saver([v1, v2])
+     
+    # 接下来，我们启动模型，使用saver来恢复保存在磁盘上的变量，并且对模型做一些操作
+    with tf.Session() as sess:
+      # 从磁盘恢复变量
+      restorer.restore(sess, "/tmp/model.ckpt")
+      print("Model restored.")
+      # 对模型做一些操作
+      ...
+
+    See Restoring Variables and Choosing which Variables to Save and Restore sections of the Variables page for more details.
+（2）有选择地恢复模型
+
+    有时我们更想要在一个预训练模型上用一个全新的数据集或者完成一个新任务对预训练模型进行调参，在这种情况下，我们可以使用Slim的帮助函数来恢复模型的一部分变量。
+
+    # 创建一些变量
+    v1 = slim.variable(name="v1", ...)
+    v2 = slim.variable(name="nested/v2", ...)
+    ...
+     
+    # 获取需要恢复的变量列表 (只包含'v2'变量). 一些方法都是等价的
+    variables_to_restore = slim.get_variables_by_name("v2")
+    # 或者
+    variables_to_restore = slim.get_variables_by_suffix("2")
+    # 或者
+    variables_to_restore = slim.get_variables(scope="nested")
+    # 或者
+    variables_to_restore = slim.get_variables_to_restore(include=["nested"])
+    # 或者
+    variables_to_restore = slim.get_variables_to_restore(exclude=["v1"])
+     
+    # 创建saver用来恢复变量
+    restorer = tf.train.Saver(variables_to_restore)
+     
+    with tf.Session() as sess:
+      # 从磁盘恢复变量
+      restorer.restore(sess, "/tmp/model.ckpt")
+      print("Model restored.")
+      # 对模型做一些操作
+      ...
+
+（3）用不同的变量名恢复模型
+
+    当从一个checkpoint文件恢复变量时，Saver在checkpoint文件中找到变量名并把它们映射为当前计算图中的变量。在上述例子中，我们传递一个变量列表给Saver并创建它，此时，Saver在checkpoint文件中查找时使用的变量名是通过传入的每个变量的var.op.name隐式获取的。当checkpoint中的变量名和计算图中的变量名匹配时这种方式很OK。然而，在有些情况下，我们想要从一个checkpoint文件中恢复一个模型，但是它的变量名和当前计算图中的变量名不同。在这种情况下，我们必须提供给Saver一个字典，把checkpoint文件中的变量名映射为计算图中的变量名。考虑下面的例子，checkpoint的查找时使用的变量名是通过一个简单函数得到的：
+
+    # 假设 'conv1/weights' 应该从 'vgg16/conv1/weights'中恢复
+    def name_in_checkpoint(var):
+      return 'vgg16/' + var.op.name
+     
+    # 假设'conv1/weights'和'conv1/bias' 应该从 'conv1/params1'和'conv1/params2'中恢复
+    def name_in_checkpoint(var):
+      if "weights" in var.op.name:
+        return var.op.name.replace("weights", "params1")
+      if "bias" in var.op.name:
+        return var.op.name.replace("bias", "params2")
+     
+    variables_to_restore = slim.get_model_variables()
+    variables_to_restore = {name_in_checkpoint(var):var for var in variables_to_restore}
+    restorer = tf.train.Saver(variables_to_restore)
+     
+    with tf.Session() as sess:
+      # 从磁盘恢复变量
+      restorer.restore(sess, "/tmp/model.ckpt")
+
+（4）在一个模型上Fine-Tuning完成一个不同的任务
+
+      考虑这种情况，我们已经用ImageNet数据集（数据集有1000个类别）训练好了VGG16的网络，然而我们想要把这个网络用于Pascal VOC（这个数据集只有20个类别），为了完成这个任务，我们可以用预训练模型（去除最后一层）来初始化我们新的模型。
+
+    # 加载Pascal VOC数据集
+    image, label = MyPascalVocDataLoader(...)
+    images, labels = tf.train.batch([image, label], batch_size=32)
+     
+    # 创建新的模型
+    predictions = vgg.vgg_16(images)
+     
+    train_op = slim.learning.create_train_op(...)
+     
+    # 指明用ImageNet预训练的VGG16模型的路径
+    model_path = '/path/to/pre_trained_on_imagenet.checkpoint'
+     
+    # 指明新模型保存的路径
+    log_dir = '/path/to/my_pascal_model_dir/'
+     
+    # 只回复预训练模型的卷积层
+    variables_to_restore = slim.get_variables_to_restore(exclude=['fc6', 'fc7', 'fc8'])
+    init_fn = assign_from_checkpoint_fn(model_path, variables_to_restore)
+     
+    # 开始训练
+    slim.learning.train(train_op, log_dir, init_fn=init_fn)
+     
+
+5、评估模型
+
+    当我们已经训练好一个模型之后（或者模型正在训练时），我们可能想要知道这个模型的实际效果到底如何。这可以用一些评估指标来评估，评估时将给模型的表现性能打分。评估代码将加载数据、执行预测、比较预测结果和真实结果并记录下评估分数。这些操作可以被单次实行或者被周期的重复执行。
+（1）评价指标（Metrics）
+
+     尽管我们定义的评价指标是一个非损失函数的性能度量，但是在评估我们的模型时我们仍然对评价指标很感兴趣。比如，我们可能想要优化的是对数损失函数，但我们感兴趣的指标可能是F1分数，或者IoU分数（IoU不可微分，因此不能用来做损失）
+    Slim提供了一系列评估操作可以使我们轻易的评估模型。概念上，计算评估指标值可以被分为三个部分如下：
+
+    1）初始化：初始化用于计算评估指标的变量
+    2）累加：执行用于计算评价指标的操作（如sums等）
+    3）最终：（可选）执行任何计算评价指标的最终操作。例如，计算均值、最小值、最大值等。
+    例如，为了计算平均绝对误差，两个变量（count 和total）需要被初始化为0。在累加阶段，我们得到一些预测值和标签值，计算它们的绝对误差，然后把总和加到total中去。每次我们获取到一个值时，count加1。最终，total除以count得到均值。
+
+    下面的例子解释了声明评估指标的API。由于评估指标通常在测试集上评估，因此我么假设用的是测试集：
+
+    images, labels = LoadTestData(...)
+    predictions = MyModel(images)
+     
+    mae_value_op, mae_update_op = slim.metrics.streaming_mean_absolute_error(predictions, labels)
+    mre_value_op, mre_update_op = slim.metrics.streaming_mean_relative_error(predictions, labels)
+    pl_value_op, pl_update_op = slim.metrics.percentage_less(mean_relative_errors, 0.3)
+
+    正如上述例子所示，评估指标的创建返回两个值，一个value_op和一个update_op。value_op是一个幂等操作，返回评估指标的当前值。update_op是一个执行累加步骤的操作并返回评价指标的值。跟踪每个value_op和update_op非常繁琐，因此Slim提供了两个方便的函数：
+
+    # 在两个列表中累加值和更新操作
+    value_ops, update_ops = slim.metrics.aggregate_metrics(
+        slim.metrics.streaming_mean_absolute_error(predictions, labels),
+        slim.metrics.streaming_mean_squared_error(predictions, labels))
+     
+    # 在两个字典中累加值和更新操作
+    names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
+        "eval/mean_absolute_error": slim.metrics.streaming_mean_absolute_error(predictions, labels),
+        "eval/mean_squared_error": slim.metrics.streaming_mean_squared_error(predictions, labels),
+    })
+
+    跟踪多个评价指标：
+
+    import tensorflow as tf
+    import tensorflow.contrib.slim.nets as nets
+     
+    slim = tf.contrib.slim
+    vgg = nets.vgg
+     
+    # 加载数据集
+    images, labels = load_data(...)
+     
+    # 定义网络模型
+    predictions = vgg.vgg_16(images)
+     
+    # 选择需要计算的评价指标
+    names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
+        "eval/mean_absolute_error": slim.metrics.streaming_mean_absolute_error(predictions, labels),
+        "eval/mean_squared_error": slim.metrics.streaming_mean_squared_error(predictions, labels),
+    })
+     
+    #使用1000个batchs来评估模型
+    num_batches = 1000
+     
+    with tf.Session() as sess:
+      sess.run(tf.global_variables_initializer())
+      sess.run(tf.local_variables_initializer())
+     
+      for batch_id in range(num_batches):
+        sess.run(names_to_updates.values())
+     
+      metric_values = sess.run(names_to_values.values())
+      for metric, value in zip(names_to_values.keys(), metric_values):
+        print('Metric %s has value: %f' % (metric, value))
+
+
+  注意： metric_ops.py 可以被单独的使用，而不用依赖于 layers.py 或者 loss_ops.py
+（2）周期性评估（Evaluation Loop）
+
+    Slim也提供了一个评估模块（evaluation.py），它包含一些帮助函数，这些函数使用metric_ops.py中评价指标来写模型评估脚本。其中就有包括一个函数，它周期的运行评估操作、计算数据batch的评估值、打印输出、summarizeing评估结果。比如：
+
+    import tensorflow as tf
+     
+    slim = tf.contrib.slim
+     
+    # 加载数据
+    images, labels = load_data(...)
+     
+    # 定义网络
+    predictions = MyModel(images)
+     
+    # 选择需要计算的评估指标
+    names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
+        'accuracy': slim.metrics.accuracy(predictions, labels),
+        'precision': slim.metrics.precision(predictions, labels),
+        'recall': slim.metrics.recall(mean_relative_errors, 0.3),
+    })
+     
+    # 创建一个summary操作
+    summary_ops = []
+    for metric_name, metric_value in names_to_values.iteritems():
+      op = tf.summary.scalar(metric_name, metric_value)
+      op = tf.Print(op, [metric_value], metric_name)
+      summary_ops.append(op)
+     
+    num_examples = 10000
+    batch_size = 32
+    num_batches = math.ceil(num_examples / float(batch_size))
+     
+    # 启动全局步骤
+    slim.get_or_create_global_step()
+     
+    # summaries保存的路径
+    output_dir = ... 
+    # 多久运行一次评估操作
+    eval_interval_secs = ... 
+    slim.evaluation.evaluation_loop(
+        'local',
+        checkpoint_dir,
+        log_dir,
+        num_evals=num_batches,
+        eval_op=names_to_updates.values(),
+        summary_op=tf.summary.merge(summary_ops),
+        eval_interval_secs=eval_interval_secs)
