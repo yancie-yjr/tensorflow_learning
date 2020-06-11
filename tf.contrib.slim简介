@@ -1,3 +1,4 @@
+https://blog.csdn.net/MOU_IT/article/details/82717745
 1、简介
 
     对于tensorflow.contrib这个库，tensorflow官方对它的描述是：此目录中的任何代码未经官方支持，可能会随时更改或删除。每个目录下都有指定的所有者。它旨在包含额外功能和贡献，最终会合并到核心TensorFlow中，但其接口可能仍然会发生变化，或者需要进行一些测试，看是否可以获得更广泛的接受。所以slim依然不属于原生tensorflow。那么什么是slim？slim到底有什么用？
